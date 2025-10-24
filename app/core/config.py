@@ -1,8 +1,9 @@
 import os
 import json
 import logging
+import base64
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Any
 
 # 获取一个日志记录器实例
 logger = logging.getLogger(__name__)
@@ -12,10 +13,9 @@ class AuthCookie:
     处理并生成 Smithery.ai 所需的认证 Cookie。
     它将 .env 文件中的 JSON 字符串转换为一个标准的 HTTP Cookie 头部字符串。
     """
-    def __init__(self, json_string: str):
+    def __init__(self, cookie_string: str):
         try:
-            # 1. 解析从 .env 文件读取的 JSON 字符串
-            data = json.loads(json_string)
+            data = self._parse_cookie_string(cookie_string)
             self.access_token = data.get("access_token")
             self.refresh_token = data.get("refresh_token")
             self.expires_at = data.get("expires_at", 0)
@@ -44,13 +44,108 @@ class AuthCookie:
             # 最终用于 HTTP Header 的字符串，格式为 "key=value"
             self.header_cookie_string = f"{cookie_key}={cookie_value}"
 
-        except json.JSONDecodeError as e:
-            raise ValueError(f"无法从提供的字符串中解析认证 JSON: {e}")
         except Exception as e:
             raise ValueError(f"初始化 AuthCookie 时出错: {e}")
 
     def __repr__(self):
         return f"<AuthCookie expires_at={self.expires_at}>"
+
+    @staticmethod
+    def _parse_cookie_string(raw_value: str) -> Dict[str, Any]:
+        if raw_value is None:
+            raise ValueError("提供的 cookie 字符串为空")
+
+        stripped = raw_value.strip()
+        if stripped and stripped[0] in {"'", '"'} and stripped[-1] == stripped[0]:
+            # 某些环境（例如 .env 文件）会为值自动包裹引号
+            stripped = stripped[1:-1].strip()
+        if not stripped:
+            raise ValueError("提供的 cookie 字符串为空")
+
+        # 先尝试从完整的 Cookie 头部中提取 JSON（如: sb-<project>-auth-token={...}）
+        try:
+            if "-auth-token=" in stripped and "{" in stripped and "}" in stripped:
+                # 只提取 '=' 之后到末尾（或到第一个分号）的部分
+                kv = stripped.split("-auth-token=", 1)[1]
+                kv = kv.split(";", 1)[0].strip()
+                if kv and kv[0] in '{"' and kv[-1] in '}"':
+                    # 去掉可能的包裹引号
+                    if kv[0] == '"' and kv[-1] == '"':
+                        kv = kv[1:-1]
+                    parsed = json.loads(kv)
+                    return parsed
+        except Exception:
+            # 提取失败则继续后续流程
+            pass
+
+        # 尝试直接解析 JSON（向后兼容旧配置）
+        try:
+            return json.loads(stripped)
+        except json.JSONDecodeError:
+            pass
+
+        def _looks_like_base64(text: str) -> bool:
+            # 允许的字符集（含 URL-safe）
+            allowed = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=_-")
+            return all(ch in allowed or ch.isspace() for ch in text)
+
+        def _try_parse_base64(text: str) -> Dict[str, Any]:
+            # 去前缀 'base64-'（用户可能未去除，此处兼容）
+            if text.lower().startswith("base64-"):
+                text = text[7:]
+
+            # 去除空白与不可见字符，并保留 base64/urlsafe 允许的字符
+            text = "".join(text.split())
+            cleaned = "".join(ch for ch in text if ch.isalnum() or ch in "+/=_-")
+            if not cleaned:
+                raise ValueError("base64 cookie 字符串为空")
+
+            # 统计非 '=' 的数据字符数，用来判断是否明显被截断
+            data_len = len(cleaned.replace("=", ""))
+            if data_len % 4 == 1:
+                # 这种情况属于不可修复的截断（无法通过补 '=' 修复）
+                raise ValueError("疑似不完整的 base64：数据长度为 4n+1，请重新完整复制")
+
+            # 自动补齐 '='（当余数为 2 或 3 时可补齐）
+            if data_len % 4 in (2, 3):
+                cleaned += "=" * (4 - (data_len % 4))
+
+            # 先按标准 base64，再按 urlsafe 尝试
+            decoded_bytes = None
+            last_err = None
+            for decoder in (base64.b64decode, base64.urlsafe_b64decode):
+                try:
+                    decoded_bytes = decoder(cleaned)
+                    break
+                except Exception as err:
+                    last_err = err
+                    decoded_bytes = None
+            if decoded_bytes is None:
+                raise ValueError("无法解析 base64 编码的 cookie 字符串") from last_err
+
+            try:
+                decoded = decoded_bytes.decode("utf-8")
+            except Exception as err:
+                raise ValueError("base64 解码后的内容不是有效的 UTF-8 字符串") from err
+
+            try:
+                return json.loads(decoded)
+            except json.JSONDecodeError as json_err:
+                raise ValueError("base64 解码后的内容不是有效的 JSON") from json_err
+
+        # 优先尝试解析 base64（带或不带前缀），仅当字符串“看起来像 base64”时
+        if _looks_like_base64(stripped):
+            try:
+                return _try_parse_base64(stripped)
+            except ValueError as e:
+                # 记录调试信息后继续最终回退错误
+                logger.debug(f"base64 解析尝试失败: {e}")
+
+        # 回退到直接解析 JSON（兼容原有配置）
+        try:
+            return json.loads(stripped)
+        except json.JSONDecodeError as json_err:
+            raise ValueError("提供的 cookie 字符串既不是可识别的 base64，也不是有效的 JSON") from json_err
 
 
 class Settings(BaseSettings):
